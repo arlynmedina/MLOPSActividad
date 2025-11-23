@@ -45,7 +45,7 @@ for slave_ip in slaves_ip:
     COPY backend_demo.py /app/backend_demo.py
     COPY cats_vs_dogs_cnn.pth /app/cats_vs_dogs_cnn.pth
     RUN pip install fastapi uvicorn pillow
-    CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+    CMD ["uvicorn", "backend_demo:app", "--host", "0.0.0.0", "--port", "8000"]
     """
 
     sftp_client = ssh_client.open_sftp()
