@@ -28,7 +28,7 @@ KEY_PATH = "id_rsa"
 USERNAME = "ec2-user"
 
 MODEL_FILE = "cats_vs_dogs_cnn.pth"
-BACKEND_FILE = "backend_demo.py"
+BACKEND_FILE = "inference_server.py"
 API_PORT = 8000
 
 
@@ -93,9 +93,9 @@ WORKDIR /app
 COPY {BACKEND_FILE} /app/{BACKEND_FILE}
 COPY {MODEL_FILE} /app/{MODEL_FILE}
 
-RUN pip install fastapi uvicorn pillow
+RUN pip install fastapi uvicorn pillow python-multipart
 
-CMD ["uvicorn", "backend_demo:app", "--host", "0.0.0.0", "--port", "{API_PORT}"]
+CMD ["uvicorn", "inference_server:app", "--host", "0.0.0.0", "--port", "{API_PORT}"]
 """.lstrip()
 
         print("Subiendo Dockerfile...")
