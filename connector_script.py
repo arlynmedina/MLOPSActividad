@@ -1,80 +1,132 @@
-import boto3
+import time
 import paramiko
 from scp import SCPClient
 
-# Constantes
-master_ip = '52.2.245.12'
-slaves_ip = ['34.207.201.212', '54.237.233.68', '3.81.94.198', '54.91.226.85', '52.55.90.184', '54.242.242.220']
 
-# Crear una sesión de boto3
-ec2_client = boto3.client('ec2', region_name='us-east-1')
+# CONFIGURACION
+MASTER_IP = "3.87.113.157"
 
-# Configurar la conexión SSH
-key_path = 'id_rsa'
-key = paramiko.RSAKey.from_private_key_file(key_path)
-ssh_client = paramiko.SSHClient()
-ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+SLAVES_PUBLIC_IPS = [
+    "3.95.2.13",
+    "3.94.89.187",
+    "35.172.138.196",
+    "98.87.7.59",
+    "13.218.211.127",
+    "98.81.190.107",
+]
 
+SLAVES_PRIVATE_IPS = [
+    "10.0.1.72",
+    "10.0.1.142",
+    "10.0.1.77",
+    "10.0.1.49",
+    "10.0.1.200",
+    "10.0.1.123",
+]
 
-### CONFIGURAR INSTANCIAS SLAVES CON LO NECESARIO
-# Conectar a las instancias slaves via SSH
-for slave_ip in slaves_ip:
-    ssh_client.connect(slave_ip, username='ec2-user', pkey=key)
-    # Subir el modelo
-    scp_client = SCPClient(ssh_client.get_transport())
-    scp_client.put('cats_vs_dogs_cnn.pth', '/home/ec2-user/cats_vs_dogs_cnn.pth')
-    # TODO: Subir archivo backend
-    scp_client.put('backend_demo.py', '/home/ec2-user/backend_demo.py')
-    # Instalar docker en los slaves
-    commands = [
-        'sudo yum update -y',
-        'sudo yum install docker -y',
-        'sudo systemctl start docker',
-        'sudo systemctl enable docker',
-        'sudo usermod -aG docker ec2-user'
-    ]
+KEY_PATH = "id_rsa"
+USERNAME = "ec2-user"
 
-    for command in commands:
-        stdin, stdout, stderr = ssh_client.exec_command(command)
-        print(stdout.read().decode(), stderr.read().decode())
-
-    # Correr la aplicacion backend en todos los slaves
-    dockerfile_content = """
-    FROM pytorch/pytorch:latest
-    WORKDIR /app
-    COPY backend_demo.py /app/backend_demo.py
-    COPY cats_vs_dogs_cnn.pth /app/cats_vs_dogs_cnn.pth
-    RUN pip install fastapi uvicorn pillow
-    CMD ["uvicorn", "backend_demo:app", "--host", "0.0.0.0", "--port", "8000"]
-    """
-
-    sftp_client = ssh_client.open_sftp()
-    with sftp_client.open('/home/ec2-user/Dockerfile', 'w') as dockerfile:
-        dockerfile.write(dockerfile_content)
-    
-    commands = [
-        'docker build -t fastapi_app .',
-        'docker run -d -p 8000:8000 fastapi_app'
-    ]
-
-    for command in commands:
-        stdin, stdout, stderr = ssh_client.exec_command(command)
-        print(stdout.read().decode(), stderr.read().decode())
-
-    # Cerrar la conexión SSH
-    ssh_client.close()
+MODEL_FILE = "cats_vs_dogs_cnn.pth"
+BACKEND_FILE = "backend_demo.py"
+API_PORT = 8000
 
 
-### CONFIGURAR INSTANCIA MASTER CON NGINX
-# Instalar NGINX en la instancia master
-ssh_client.connect(master_ip, username='ec2-user', pkey=key)
+# UTILS
+def ssh_connect(ip: str) -> paramiko.SSHClient:
+    key = paramiko.RSAKey.from_private_key_file(KEY_PATH)
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-# Archivo de configuración de NGINX (master)
-upstream_servers = "\n        ".join([f"server {ip}:8000;" for ip in slaves_ip])
+    print(f"\nConectando a {ip} ...")
+    ssh.connect(ip, username=USERNAME, pkey=key)
+    return ssh
 
-nginx_config = f"""
+
+def run_commands(ssh: paramiko.SSHClient, commands: list[str]) -> None:
+    for cmd in commands:
+        print(f"Ejecutando: {cmd}")
+        _, stdout, stderr = ssh.exec_command(cmd)
+        out = stdout.read().decode()
+        err = stderr.read().decode()
+        if out:
+            print(out)
+        if err:
+            print(err)
+
+
+def upload_files(ssh: paramiko.SSHClient, files: list[tuple[str, str]]) -> None:
+    with SCPClient(ssh.get_transport()) as scp:
+        for src, dest in files:
+            print(f"Subiendo {src} -> {dest}")
+            scp.put(src, dest)
+
+
+# CONFIGURAR SLAVES
+def setup_slaves() -> None:
+    for ip in SLAVES_PUBLIC_IPS:
+        ssh = ssh_connect(ip)
+
+        # Subir backend + modelo
+        upload_files(ssh, [
+            (MODEL_FILE, f"/home/{USERNAME}/{MODEL_FILE}"),
+            (BACKEND_FILE, f"/home/{USERNAME}/{BACKEND_FILE}"),
+        ])
+
+        # Instalar Docker
+        run_commands(ssh, [
+            "sudo yum update -y",
+            "sudo yum install -y docker",
+            "sudo systemctl start docker",
+            "sudo systemctl enable docker",
+            f"sudo usermod -aG docker {USERNAME}",
+        ])
+
+        time.sleep(2)
+
+        # Crear Dockerfile
+        dockerfile = f"""
+FROM pytorch/pytorch:latest
+
+WORKDIR /app
+
+COPY {BACKEND_FILE} /app/{BACKEND_FILE}
+COPY {MODEL_FILE} /app/{MODEL_FILE}
+
+RUN pip install fastapi uvicorn pillow
+
+CMD ["uvicorn", "backend_demo:app", "--host", "0.0.0.0", "--port", "{API_PORT}"]
+""".lstrip()
+
+        print("Subiendo Dockerfile...")
+        sftp = ssh.open_sftp()
+        with sftp.open(f"/home/{USERNAME}/Dockerfile", "w") as f:
+            f.write(dockerfile)
+        sftp.close()
+
+        # Construir y ejecutar la app backend
+        run_commands(ssh, [
+            "cd /home/ec2-user && sudo docker build -t fastapi_app .",
+            "sudo docker rm -f fastapi_app || true",
+            f"sudo docker run -d -p {API_PORT}:{API_PORT} --name fastapi_app fastapi_app",
+        ])
+
+        print(f"Slave configurado correctamente: {ip}")
+        ssh.close()
+
+
+# CONFIGURAR MASTER
+def setup_master() -> None:
+    ssh = ssh_connect(MASTER_IP)
+
+    # Usamos IPs PRIVADAS en el upstream
+    upstream = "\n        ".join(
+        [f"server {ip}:{API_PORT};" for ip in SLAVES_PRIVATE_IPS])
+
+    nginx_conf = f"""
 user nginx;
 worker_processes auto;
+
 error_log /var/log/nginx/error.log warn;
 pid /var/run/nginx.pid;
 
@@ -84,7 +136,7 @@ events {{
 
 http {{
     upstream fastapi_app {{
-        {upstream_servers}
+        {upstream}
     }}
 
     server {{
@@ -99,26 +151,33 @@ http {{
         }}
     }}
 }}
-"""
+""".lstrip()
 
-# Crear/modificar el archivo de configuración en /etc/nginx/nginx.conf
-sftp_client = ssh_client.open_sftp()
-with sftp_client.open('/home/ec2-user/nginx.conf', 'w') as conf_file:
-    conf_file.write(nginx_config)
-sftp_client.close()
-# Mover el archivo de configuración a la ubicación correcta y reiniciar NGINX
-commands = [
-    'sudo yum update -y',
-    'sudo yum install nginx -y',
-    'sudo systemctl start nginx',
-    'sudo systemctl enable nginx',
-    "sudo mv /home/ec2-user/nginx.conf /etc/nginx/nginx.conf",
-    "sudo systemctl restart nginx"
-]
-for cmd in commands:
-    stdin, stdout, stderr = ssh_client.exec_command(cmd)
-    print(stdout.read().decode(), stderr.read().decode())
+    print("Subiendo configuracion de NGINX...")
+    sftp = ssh.open_sftp()
+    with sftp.open(f"/home/{USERNAME}/nginx.conf", "w") as f:
+        f.write(nginx_conf)
+    sftp.close()
 
-print("Configuración en master y slaves completada.")
-# Cerrar la conexión SSH
-ssh_client.close()
+    run_commands(ssh, [
+        "sudo yum update -y",
+        "sudo yum install -y nginx",
+        "sudo systemctl start nginx",
+        "sudo systemctl enable nginx",
+        f"sudo mv -f /home/{USERNAME}/nginx.conf /etc/nginx/nginx.conf",
+        "sudo nginx -t",
+        "sudo systemctl restart nginx",
+    ])
+
+    print("Master configurado correctamente.")
+    ssh.close()
+
+
+if __name__ == "__main__":
+    print("\n=== CONFIGURANDO SLAVES ===")
+    setup_slaves()
+
+    print("\n=== CONFIGURANDO MASTER ===")
+    setup_master()
+
+    print("\n=== CONFIGURACION COMPLETA ===\n")
